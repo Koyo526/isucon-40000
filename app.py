@@ -552,12 +552,30 @@ def get_image(id, ext):
             filename = generate_image_filename(id, mime)
             image_path = get_image_path(filename)
             
+            # Debug: Check what we actually have
+            print(f"DEBUG: Migrating image {id}, imgdata type: {type(imgdata)}, length: {len(imgdata) if imgdata else 0}")
+            
+            # Handle different data types from MySQL
+            if imgdata is None or len(imgdata) == 0:
+                flask.abort(404)  # No image data
+            
             # Write binary data to file
             with open(image_path, 'wb') as f:
                 if isinstance(imgdata, str):
-                    f.write(imgdata.encode('latin1'))  # Handle encoding issues
-                else:
+                    # String data - encode as bytes
+                    f.write(imgdata.encode('latin1'))
+                elif isinstance(imgdata, bytes):
+                    # Already bytes - write directly
                     f.write(imgdata)
+                else:
+                    # Other types (e.g., bytearray) - convert to bytes
+                    f.write(bytes(imgdata))
+            
+            # Verify file was written successfully
+            if not image_path.exists() or image_path.stat().st_size == 0:
+                raise Exception("File was not written or is empty")
+            
+            print(f"DEBUG: Successfully wrote {image_path.stat().st_size} bytes to {image_path}")
             
             # Update database record to store filename instead of binary data
             cursor.execute("UPDATE `posts` SET `imgdata` = %s WHERE `id` = %s", (filename, id))
@@ -566,6 +584,7 @@ def get_image(id, ext):
             return flask.send_file(str(image_path), mimetype=mime)
             
         except Exception as e:
+            print(f"DEBUG: Migration failed for image {id}: {e}")
             # If migration fails, fall back to serving from memory
             return flask.Response(imgdata, mimetype=mime)
 
