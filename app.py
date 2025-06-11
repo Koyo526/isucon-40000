@@ -82,6 +82,18 @@ def memcache():
         )
     return _mcclient
 
+def cache_get(key: str):
+    try:
+        return memcache().get(key)
+    except Exception:
+        return None   # memcached が死んでいてもアプリを落とさない
+
+def cache_set(key: str, value, ttl: int = 30):
+    try:
+        memcache().set(key, value, expire=ttl)
+    except Exception:
+        pass
+
 
 def try_login(account_name, password):
     cur = db().cursor()
@@ -338,60 +350,70 @@ def get_logout():
 @app.route("/")
 def get_index():
     me = get_session_user()
+    cache_key = "tl:top"
 
-    cursor = db().cursor()
-    cursor.execute(
-        "SELECT `id`, `user_id`, `body`, `created_at`, `mime` FROM `posts` ORDER BY `created_at` DESC"
-    )
-    posts = make_posts(cursor.fetchall())
+    posts = cache_get(cache_key)
+    if posts is None:
+        cursor = db().cursor()
+        cursor.execute(
+            "SELECT id, user_id, body, created_at, mime FROM posts ORDER BY created_at DESC"
+        )
+        posts = make_posts(cursor.fetchall())
+        cache_set(cache_key, posts, ttl=30)
 
     return flask.render_template("index.html", posts=posts, me=me)
 
 
 @app.route("/@<account_name>")
 def get_user_list(account_name):
-    cursor = db().cursor()
+    cache_key = f"user:{account_name}:page0"
+    cached = cache_get(cache_key)
+    if cached:
+        user, posts, stats = cached
+    else:
+        cur = db().cursor(dictionary=True)
 
-    cursor.execute(
-        "SELECT * FROM `users` WHERE `account_name` = %s AND `del_flg` = 0",
-        (account_name,),
-    )
-    user = cursor.fetchone()
-    if user is None:
-        flask.abort(404)  # raises exception
+        # 1) ユーザ存在チェック
+        cur.execute(
+            "SELECT id, account_name, display_name FROM users "
+            "WHERE account_name=%s AND del_flg=0",
+            (account_name,))
+        user = cur.fetchone()
+        if user is None:
+            flask.abort(404)
 
-    cursor.execute(
-        "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = %s ORDER BY `created_at` DESC",
-        (user["id"],),
-    )
-    posts = make_posts(cursor.fetchall())
+        uid = user["id"]
 
-    cursor.execute(
-        "SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = %s", (user["id"],)
-    )
-    comment_count = cursor.fetchone()["count"]
+        # 2) 投稿 30 件
+        cur.execute(
+            "SELECT id, user_id, body, mime, created_at "
+            "FROM posts WHERE user_id=%s "
+            "ORDER BY created_at DESC LIMIT 30",
+            (uid,))
+        posts = make_posts(cur.fetchall())
 
-    cursor.execute("SELECT `id` FROM `posts` WHERE `user_id` = %s", (user["id"],))
-    post_ids = [p["id"] for p in cursor]
-    post_count = len(post_ids)
+        # 3) 投稿数・コメント数を 1 回で取得
+        cur.execute(
+            """
+            SELECT
+              (SELECT COUNT(*) FROM posts    WHERE user_id=%s) AS post_cnt,
+              (SELECT COUNT(*) FROM comments WHERE user_id=%s) AS comment_cnt,
+              (SELECT COUNT(*) FROM comments WHERE post_id IN
+                 (SELECT id FROM posts WHERE user_id=%s))      AS commented_cnt
+            """,
+            (uid, uid, uid))
+        stats = cur.fetchone()
 
-    commented_count = 0
-    if post_count > 0:
-        cursor.execute(
-            "SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN %s",
-            (post_ids,),
-        )
-        commented_count = cursor.fetchone()["count"]
+        cache_set(cache_key, (user, posts, stats), ttl=30)
 
     me = get_session_user()
-
     return flask.render_template(
         "user.html",
         posts=posts,
         user=user,
-        post_count=post_count,
-        comment_count=comment_count,
-        commented_count=commented_count,
+        post_count=stats["post_cnt"],
+        comment_count=stats["comment_cnt"],
+        commented_count=stats["commented_cnt"],
         me=me,
     )
 
@@ -407,20 +429,36 @@ def _parse_iso8601(s):
 
 @app.route("/posts")
 def get_posts():
+    me = get_session_user()
+    max_created_at = flask.request.args.get("max_created_at")  # None → 最初の 30 件
+    cache_key = f"tl:before:{max_created_at or 'top'}"
+    posts = cache_get(cache_key)
+    if posts is None:
+        cur = db().cursor(dictionary=True)
+        if max_created_at:
+            cur.execute(
+                "SELECT id, user_id, body, mime, created_at "
+                "FROM posts WHERE created_at < %s "
+                "ORDER BY created_at DESC LIMIT 30",
+                (max_created_at,))
+        else:
+            cur.execute(
+                "SELECT id, user_id, body, mime, created_at "
+                "FROM posts ORDER BY created_at DESC LIMIT 30")
+        posts = make_posts(cur.fetchall())
+        cache_set(cache_key, posts, ttl=30)
+    return flask.render_template("posts.html", posts=posts)
+
+
+@app.route("/posts/<id>")
+def get_posts_id(id):
     cursor = db().cursor()
-    max_created_at = flask.request.args["max_created_at"] or None
-    if max_created_at:
-        max_created_at = _parse_iso8601(max_created_at)
-        cursor.execute(
-            "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= %s ORDER BY `created_at` DESC",
-            (max_created_at,),
-        )
-    else:
-        cursor.execute(
-            "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE ORDER BY `created_at` DESC"
-        )
-    results = cursor.fetchall()
-    posts = make_posts(results)
+
+    cursor.execute("SELECT * FROM `posts` WHERE `id` = %s", (id,))
+    posts = make_posts(cursor.fetchall())
+    if not posts:
+        flask.abort(404)
+
     return flask.render_template("posts.html", posts=posts)
 
 
@@ -590,7 +628,19 @@ def post_comment():
     cursor = db().cursor()
     cursor.execute(query, (post_id, me["id"], flask.request.form["comment"]))
 
-    return flask.redirect("/posts/%d" % post_id)
+    # ---- キャッシュ失効 ----
+    memcache().delete("tl:top")
+    memcache().delete(f"post:{post_id}")
+
+    # コメントされた投稿のオーナー TL も
+    cursor.execute(
+        "SELECT account_name FROM users "
+        "WHERE id = (SELECT user_id FROM posts WHERE id=%s)", (post_id,))
+    owner = cursor.fetchone()
+    if owner:
+        memcache().delete(f"user:{owner['account_name']}:page0")
+
+    return flask.redirect(f"/posts/{post_id}")
 
 
 @app.route("/admin/banned")
