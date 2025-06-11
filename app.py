@@ -371,7 +371,7 @@ def get_user_list(account_name):
     if cached:
         user, posts, stats = cached
     else:
-        cur = db().cursor(dictionary=True)
+        cur = db().cursor()
 
         # 1) ユーザ存在チェック
         cur.execute(
@@ -434,7 +434,7 @@ def get_posts():
     cache_key = f"tl:before:{max_created_at or 'top'}"
     posts = cache_get(cache_key)
     if posts is None:
-        cur = db().cursor(dictionary=True)
+        cur = db().cursor()
         if max_created_at:
             cur.execute(
                 "SELECT id, user_id, body, mime, created_at "
