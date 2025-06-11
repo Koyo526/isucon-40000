@@ -217,6 +217,7 @@ def get_initialize():
 
 @app.route("/login")
 def get_login():
+    print("login#########")
     if get_session_user():
         return flask.redirect("/")
     return flask.render_template("login.html", me=None)
