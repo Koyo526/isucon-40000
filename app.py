@@ -375,7 +375,7 @@ def get_user_list(account_name):
 
         # 1) ユーザ存在チェック
         cur.execute(
-            "SELECT id, account_name, display_name FROM users "
+            "SELECT id, account_name FROM users "
             "WHERE account_name=%s AND del_flg=0",
             (account_name,))
         user = cur.fetchone()
