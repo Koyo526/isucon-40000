@@ -450,17 +450,6 @@ def get_posts():
     return flask.render_template("posts.html", posts=posts)
 
 
-@app.route("/posts/<id>")
-def get_posts_id(id):
-    cursor = db().cursor()
-
-    cursor.execute("SELECT * FROM `posts` WHERE `id` = %s", (id,))
-    posts = make_posts(cursor.fetchall())
-    if not posts:
-        flask.abort(404)
-
-    return flask.render_template("posts.html", posts=posts)
-
 
 @app.route("/posts/<id>")
 def get_posts_id(id):
