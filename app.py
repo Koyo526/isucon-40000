@@ -16,7 +16,6 @@ from pymemcache.client.base import Client as MemcacheClient
 UPLOAD_LIMIT = 10 * 1024 * 1024  # 10mb
 POSTS_PER_PAGE = 20
 
-
 _config = None
 
 
@@ -447,6 +446,7 @@ def get_image(id, ext):
 
 @app.route("/comment", methods=["POST"])
 def post_comment():
+    printf("hi")
     me = get_session_user()
     if not me:
         return flask.redirect("/login")
