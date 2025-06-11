@@ -453,29 +453,6 @@ def post_index():
     cursor = db().cursor()
     cursor.execute(query, (me["id"], mime, imgdata, flask.request.form.get("body")))
     pid = cursor.lastrowid
-<<<<<<< Updated upstream
-=======
-    
-    # Generate filename and save to filesystem
-    filename = generate_image_filename(pid, mime)
-    image_path = get_image_path(filename)
-    
-    try:
-        file.save(str(image_path))
-        
-        # Update the post record with the image filename
-        cursor.execute("UPDATE `posts` SET `imgdata` = %s WHERE `id` = %s",(filename, pid))
-        # ---- キャッシュ失効 ----
-        memcache().delete("tl:top")                       # ホーム TL
-        memcache().delete(f"user:{me['account_name']}:page0")  # 自分の TL
-
-    except Exception as e:
-        # If file save fails, delete the post record
-        cursor.execute("DELETE FROM `posts` WHERE `id` = %s", (pid,))
-        flask.flash("画像の保存に失敗しました")
-        return flask.redirect("/")
-
->>>>>>> Stashed changes
     return flask.redirect("/posts/%d" % pid)
 
 
