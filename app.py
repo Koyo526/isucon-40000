@@ -510,7 +510,7 @@ def get_image(id, ext):
         flask.abort(404)
 
     mime = post["mime"]
-    filename = post["imgdata"]  # Now stores filename instead of binary data
+    imgdata = post["imgdata"]
     
     # Verify the requested extension matches the stored MIME type
     if not ((ext == "jpg" and mime == "image/jpeg") or 
@@ -518,18 +518,24 @@ def get_image(id, ext):
             (ext == "gif" and mime == "image/gif")):
         flask.abort(404)
     
-    # Get the image file path
-    image_path = get_image_path(filename)
-    
-    # Check if file exists
-    if not image_path.exists():
-        flask.abort(404)
-    
-    # Serve the file
-    try:
-        return flask.send_file(str(image_path), mimetype=mime)
-    except Exception:
-        flask.abort(404)
+    # Check if imgdata is a filename (new format) or binary data (old format)
+    if isinstance(imgdata, str) and len(imgdata) < 100:
+        # New format: imgdata contains filename
+        filename = imgdata
+        image_path = get_image_path(filename)
+        
+        # Check if file exists
+        if not image_path.exists():
+            flask.abort(404)
+        
+        # Serve the file from filesystem
+        try:
+            return flask.send_file(str(image_path), mimetype=mime)
+        except Exception:
+            flask.abort(404)
+    else:
+        # Old format: imgdata contains binary data - serve directly from memory
+        return flask.Response(imgdata, mimetype=mime)
 
 
 @app.route("/comment", methods=["POST"])
