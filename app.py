@@ -5,6 +5,7 @@ import re
 import shlex
 import subprocess
 import tempfile
+import uuid
 
 import flask
 import MySQLdb.cursors
@@ -236,16 +237,17 @@ Session(app)
 
 @app.template_global()
 def image_url(post):
-    ext = ""
-    mime = post["mime"]
-    if mime == "image/jpeg":
-        ext = ".jpg"
-    elif mime == "image/png":
-        ext = ".png"
-    elif mime == "image/gif":
-        ext = ".gif"
-
-    return "/image/%s%s" % (post["id"], ext)
+    # The imgdata field now contains the filename instead of binary data
+    filename = post.get("imgdata")
+    if filename:
+        return f"/images/{filename}"
+    
+    # Fallback to old method if imgdata is not a filename (for backward compatibility)
+    ext = get_image_extension(post.get("mime", ""))
+    if ext:
+        return f"/image/{post['id']}{ext}"
+    
+    return ""
 
 
 # http://flask.pocoo.org/snippets/28/
@@ -458,21 +460,37 @@ def post_index():
         flask.flash("投稿できる画像形式はjpgとpngとgifだけです")
         return flask.redirect("/")
 
-    with tempfile.TemporaryFile() as tempf:
-        file.save(tempf)
-        tempf.flush()
+    # Check file size before saving
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
+    
+    if file_size > UPLOAD_LIMIT:
+        flask.flash("ファイルサイズが大きすぎます")
+        return flask.redirect("/")
 
-        if tempf.tell() > UPLOAD_LIMIT:
-            flask.flash("ファイルサイズが大きすぎます")
-            return flask.redirect("/")
-
-        tempf.seek(0)
-        imgdata = tempf.read()
-
-    query = "INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (%s,%s,%s,%s)"
+    # Insert post record first to get the post ID
+    query = "INSERT INTO `posts` (`user_id`, `mime`, `body`) VALUES (%s, %s, %s)"
     cursor = db().cursor()
-    cursor.execute(query, (me["id"], mime, imgdata, flask.request.form.get("body")))
+    cursor.execute(query, (me["id"], mime, flask.request.form.get("body")))
     pid = cursor.lastrowid
+    
+    # Generate filename and save to filesystem
+    filename = generate_image_filename(pid, mime)
+    image_path = get_image_path(filename)
+    
+    try:
+        file.save(str(image_path))
+        
+        # Update the post record with the image filename
+        cursor.execute("UPDATE `posts` SET `imgdata` = %s WHERE `id` = %s", (filename, pid))
+        
+    except Exception as e:
+        # If file save fails, delete the post record
+        cursor.execute("DELETE FROM `posts` WHERE `id` = %s", (pid,))
+        flask.flash("画像の保存に失敗しました")
+        return flask.redirect("/")
+
     return flask.redirect("/posts/%d" % pid)
 
 
@@ -485,21 +503,33 @@ def get_image(id, ext):
         return ""
 
     cursor = db().cursor()
-    cursor.execute("SELECT * FROM `posts` WHERE `id` = %s", (id,))
+    cursor.execute("SELECT `mime`, `imgdata` FROM `posts` WHERE `id` = %s", (id,))
     post = cursor.fetchone()
+    
+    if not post:
+        flask.abort(404)
 
     mime = post["mime"]
-    if (
-        ext == "jpg"
-        and mime == "image/jpeg"
-        or ext == "png"
-        and mime == "image/png"
-        or ext == "gif"
-        and mime == "image/gif"
-    ):
-        return flask.Response(post["imgdata"], mimetype=mime)
-
-    flask.abort(404)
+    filename = post["imgdata"]  # Now stores filename instead of binary data
+    
+    # Verify the requested extension matches the stored MIME type
+    if not ((ext == "jpg" and mime == "image/jpeg") or 
+            (ext == "png" and mime == "image/png") or 
+            (ext == "gif" and mime == "image/gif")):
+        flask.abort(404)
+    
+    # Get the image file path
+    image_path = get_image_path(filename)
+    
+    # Check if file exists
+    if not image_path.exists():
+        flask.abort(404)
+    
+    # Serve the file
+    try:
+        return flask.send_file(str(image_path), mimetype=mime)
+    except Exception:
+        flask.abort(404)
 
 
 @app.route("/comment", methods=["POST"])
@@ -561,3 +591,27 @@ def post_banned():
         cursor.execute(query, (1, id))
 
     return flask.redirect("/admin/banned")
+
+
+def get_image_extension(mime_type):
+    """Get file extension from MIME type"""
+    extensions = {
+        "image/jpeg": ".jpg",
+        "image/png": ".png", 
+        "image/gif": ".gif"
+    }
+    return extensions.get(mime_type, "")
+
+
+def generate_image_filename(post_id, mime_type):
+    """Generate a unique filename for an image"""
+    ext = get_image_extension(mime_type)
+    return f"{post_id}{ext}"
+
+
+def get_image_path(filename):
+    """Get the full filesystem path for an image"""
+    static_path = pathlib.Path(__file__).resolve().parent.parent / "public"
+    images_dir = static_path / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    return images_dir / filename
