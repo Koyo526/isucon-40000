@@ -3,6 +3,7 @@ import os
 import pathlib
 import re
 import shlex
+import shutil
 import subprocess
 import tempfile
 import uuid
@@ -237,12 +238,8 @@ Session(app)
 
 @app.template_global()
 def image_url(post):
-    # The imgdata field now contains the filename instead of binary data
-    filename = post.get("imgdata")
-    if filename:
-        return f"/images/{filename}"
-    
-    # Fallback to old method if imgdata is not a filename (for backward compatibility)
+    # Always use the /image/<id>.<ext> endpoint which handles both formats
+    # and performs on-demand migration for old BLOB data
     ext = get_image_extension(post.get("mime", ""))
     if ext:
         return f"/image/{post['id']}{ext}"
@@ -469,25 +466,39 @@ def post_index():
         flask.flash("ファイルサイズが大きすぎます")
         return flask.redirect("/")
 
-    # Insert post record first to get the post ID
-    query = "INSERT INTO `posts` (`user_id`, `mime`, `body`) VALUES (%s, %s, %s)"
-    cursor = db().cursor()
-    cursor.execute(query, (me["id"], mime, flask.request.form.get("body")))
-    pid = cursor.lastrowid
-    
-    # Generate filename and save to filesystem
-    filename = generate_image_filename(pid, mime)
-    image_path = get_image_path(filename)
-    
+    # Save file to temporary location first to get the data
+    with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+        file.save(temp_file.name)
+        temp_path = temp_file.name
+
     try:
-        file.save(str(image_path))
+        # Insert post record with temporary placeholder for imgdata
+        query = "INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (%s, %s, %s, %s)"
+        cursor = db().cursor()
+        cursor.execute(query, (me["id"], mime, "temp", flask.request.form.get("body")))
+        pid = cursor.lastrowid
         
-        # Update the post record with the image filename
+        # Generate filename and final path
+        filename = generate_image_filename(pid, mime)
+        image_path = get_image_path(filename)
+        
+        # Move temp file to final location
+        shutil.move(temp_path, str(image_path))
+        
+        # Update the post record with the actual filename
         cursor.execute("UPDATE `posts` SET `imgdata` = %s WHERE `id` = %s", (filename, pid))
         
     except Exception as e:
-        # If file save fails, delete the post record
-        cursor.execute("DELETE FROM `posts` WHERE `id` = %s", (pid,))
+        # Clean up: remove temp file if it exists
+        try:
+            os.unlink(temp_path)
+        except:
+            pass
+        # Delete the post record if it was created
+        try:
+            cursor.execute("DELETE FROM `posts` WHERE `id` = %s", (pid,))
+        except:
+            pass
         flask.flash("画像の保存に失敗しました")
         return flask.redirect("/")
 
@@ -534,8 +545,29 @@ def get_image(id, ext):
         except Exception:
             flask.abort(404)
     else:
-        # Old format: imgdata contains binary data - serve directly from memory
-        return flask.Response(imgdata, mimetype=mime)
+        # Old format: imgdata contains binary data
+        # MIGRATE ON-DEMAND: Convert to filesystem and update database
+        try:
+            # Generate filename for this post
+            filename = generate_image_filename(id, mime)
+            image_path = get_image_path(filename)
+            
+            # Write binary data to file
+            with open(image_path, 'wb') as f:
+                if isinstance(imgdata, str):
+                    f.write(imgdata.encode('latin1'))  # Handle encoding issues
+                else:
+                    f.write(imgdata)
+            
+            # Update database record to store filename instead of binary data
+            cursor.execute("UPDATE `posts` SET `imgdata` = %s WHERE `id` = %s", (filename, id))
+            
+            # Serve the newly created file
+            return flask.send_file(str(image_path), mimetype=mime)
+            
+        except Exception as e:
+            # If migration fails, fall back to serving from memory
+            return flask.Response(imgdata, mimetype=mime)
 
 
 @app.route("/comment", methods=["POST"])
