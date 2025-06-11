@@ -129,39 +129,97 @@ def get_session_user():
 
 
 def make_posts(results, all_comments=False):
+    if not results:
+        return []
+    
     posts = []
     cursor = db().cursor()
+    
+    # Extract post IDs for batch queries
+    post_ids = [post["id"] for post in results]
+    
+    # Query 1: Get all post authors in one query
+    placeholders = ','.join(['%s'] * len(post_ids))
+    cursor.execute(f"""
+        SELECT u.id, u.account_name, u.passhash, u.authority, u.del_flg, u.created_at
+        FROM users u
+        WHERE u.id IN (SELECT DISTINCT user_id FROM posts WHERE id IN ({placeholders}))
+    """, post_ids)
+    users_data = {user["id"]: user for user in cursor.fetchall()}
+    
+    # Query 2: Get comment counts for all posts in one query
+    cursor.execute(f"""
+        SELECT post_id, COUNT(*) as count
+        FROM comments
+        WHERE post_id IN ({placeholders})
+        GROUP BY post_id
+    """, post_ids)
+    comment_counts = {row["post_id"]: row["count"] for row in cursor.fetchall()}
+    
+    # Query 3: Get comments with their authors in one query
+    limit_condition = 3 if not all_comments else 999999  # Large number for all comments
+    cursor.execute(f"""
+        SELECT c.id, c.post_id, c.user_id, c.comment, c.created_at,
+               u.id as comment_user_id, u.account_name as comment_user_account_name, 
+               u.passhash as comment_user_passhash, u.authority as comment_user_authority,
+               u.del_flg as comment_user_del_flg, u.created_at as comment_user_created_at
+        FROM (
+            SELECT c1.id, c1.post_id, c1.user_id, c1.comment, c1.created_at,
+                   ROW_NUMBER() OVER (PARTITION BY c1.post_id ORDER BY c1.created_at DESC) as rn
+            FROM comments c1
+            WHERE c1.post_id IN ({placeholders})
+        ) c
+        JOIN users u ON c.user_id = u.id
+        WHERE c.rn <= %s
+        ORDER BY c.post_id, c.created_at ASC
+    """, post_ids + [limit_condition])
+    
+    # Group comments by post_id
+    comments_by_post = {}
+    for row in cursor.fetchall():
+        post_id = row["post_id"]
+        if post_id not in comments_by_post:
+            comments_by_post[post_id] = []
+        
+        # Create comment object with user data
+        comment = {
+            "id": row["id"],
+            "post_id": row["post_id"],
+            "user_id": row["user_id"],
+            "comment": row["comment"],
+            "created_at": row["created_at"],
+            "user": {
+                "id": row["comment_user_id"],
+                "account_name": row["comment_user_account_name"],
+                "passhash": row["comment_user_passhash"],
+                "authority": row["comment_user_authority"],
+                "del_flg": row["comment_user_del_flg"],
+                "created_at": row["comment_user_created_at"]
+            }
+        }
+        comments_by_post[post_id].append(comment)
+    
+    # Build the final posts array
     for post in results:
-        cursor.execute(
-            "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = %s",
-            (post["id"],),
-        )
-        post["comment_count"] = cursor.fetchone()["count"]
-
-        query = (
-            "SELECT * FROM `comments` WHERE `post_id` = %s ORDER BY `created_at` DESC"
-        )
-        if not all_comments:
-            query += " LIMIT 3"
-
-        cursor.execute(query, (post["id"],))
-        comments = list(cursor)
-        for comment in comments:
-            cursor.execute(
-                "SELECT * FROM `users` WHERE `id` = %s", (comment["user_id"],)
-            )
-            comment["user"] = cursor.fetchone()
-        comments.reverse()
-        post["comments"] = comments
-
-        cursor.execute("SELECT * FROM `users` WHERE `id` = %s", (post["user_id"],))
-        post["user"] = cursor.fetchone()
-
-        if not post["user"]["del_flg"]:
+        post_id = post["id"]
+        
+        # Add comment count
+        post["comment_count"] = comment_counts.get(post_id, 0)
+        
+        # Add comments
+        post["comments"] = comments_by_post.get(post_id, [])
+        
+        # Add post author
+        post["user"] = users_data.get(post["user_id"])
+        
+        # Only include posts from non-deleted users
+        if post["user"] and not post["user"]["del_flg"]:
             posts.append(post)
-
-        if len(posts) >= POSTS_PER_PAGE:
-            break
+            
+            # Respect the POSTS_PER_PAGE limit
+            if len(posts) >= POSTS_PER_PAGE:
+                break
+    
     return posts
 
 
@@ -217,7 +275,6 @@ def get_initialize():
 
 @app.route("/login")
 def get_login():
-    print("login#########")
     if get_session_user():
         return flask.redirect("/")
     return flask.render_template("login.html", me=None)
@@ -447,7 +504,6 @@ def get_image(id, ext):
 
 @app.route("/comment", methods=["POST"])
 def post_comment():
-    printf("hi")
     me = get_session_user()
     if not me:
         return flask.redirect("/login")
